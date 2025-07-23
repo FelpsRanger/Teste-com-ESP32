@@ -6,7 +6,7 @@
 #define ML_PROCESSOR_H
 
 #include <Arduino.h>
-#include "config.h"
+#include "tflite_config.h"
 
 // Forward declarations condicionais
 #if TFLITE_AVAILABLE
@@ -15,7 +15,7 @@
     #include "tensorflow/lite/micro/micro_interpreter.h"
     #include "tensorflow/lite/micro/all_ops_resolver.h"
     #include "tensorflow/lite/schema/schema_generated.h"
-    #include "tensorflow/lite/version.h"
+    
   #elif __has_include("TensorFlowLite_ESP32.h")
     #include "TensorFlowLite_ESP32.h"
   #elif __has_include("TensorFlowLite.h")
