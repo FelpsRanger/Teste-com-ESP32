@@ -3,6 +3,8 @@
  */
 
 #include "ml_processor.h"
+#include "tflite_config.h"
+
 
 MLProcessor::MLProcessor() : 
 #if TFLITE_AVAILABLE
