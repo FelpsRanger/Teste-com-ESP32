@@ -1,5 +1,5 @@
 /*
- * TinyML Voice Recognition - Versão Otimizada para Economia de Energia
+ * TinyML Voice Recognition - Versão Compacta e Otimizada
  * Sistema de reconhecimento de voz com gestão inteligente de energia
  */
 
@@ -8,185 +8,122 @@
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <esp_pm.h>
-#include <ArduinoJson.h>
 #include "config.h"
 #include "audio_processor.h"
 #include "ml_processor.h"
-#include "power_manager.h"
 
-// Estados de energia
-enum PowerState {
-  POWER_ACTIVE,           // Processamento ativo
-  POWER_LISTENING,        // Escutando por comandos
-  POWER_LIGHT_SLEEP,      // Sleep leve
-  POWER_DEEP_SLEEP        // Sleep profundo
-};
+// Estados simplificados
+enum PowerMode { ACTIVE, LISTENING, SLEEPING };
 
-// Configurações de energia
-struct PowerConfig {
-  uint32_t active_timeout_ms = 5000;        // Timeout para modo ativo
-  uint32_t listening_timeout_ms = 30000;    // Timeout para modo listening
-  uint32_t deep_sleep_duration_s = 60;      // Duração do deep sleep
-  uint32_t vad_check_interval_ms = 50;      // Intervalo de checagem VAD
-  float vad_sensitivity = 0.0005f;          // Sensibilidade VAD reduzida
-  uint8_t cpu_freq_mhz = 80;                // CPU freq reduzida
-} power_config;
+// Configurações globais
+struct Config {
+  uint32_t active_timeout = 5000;
+  uint32_t listen_timeout = 30000;
+  uint32_t sleep_duration = 60;
+  uint32_t vad_interval = 100;
+  float vad_threshold = 0.001f;
+  uint8_t low_cpu_freq = 80;
+} config;
 
-// Variáveis globais de energia
-PowerState current_power_state = POWER_LISTENING;
-unsigned long last_voice_activity = 0;
-unsigned long last_user_interaction = 0;
-unsigned long last_vad_check = 0;
-bool voice_detected_flag = false;
-uint32_t wake_count = 0;
+// Variáveis globais
+PowerMode power_mode = LISTENING;
+unsigned long last_activity = 0;
+bool voice_detected = false;
 
-// Buffers otimizados
-int16_t* audio_buffer_small;  // Buffer menor para VAD
-int16_t* audio_buffer_full;   // Buffer completo para inferência
-float* preprocessed_audio;
-bool buffers_allocated = false;
+// Buffers dinâmicos
+int16_t* audio_small = nullptr;    // VAD rápido
+int16_t* audio_full = nullptr;     // Processamento completo
+float* features = nullptr;         // Features ML
+bool full_buffers_ready = false;
+
+// Instância do processador ML
+MLProcessor ml_processor;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
   
-  Serial.println("🚀 Inicializando Sistema de Baixo Consumo...");
+  Serial.println("🚀 TinyML Voice - Iniciando...");
   
-  // Configurar gerenciamento de energia avançado
-  setup_power_management();
+  // Configurar energia
+  setup_power();
   
   // Configurar pinos
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   
-  // Configurar wake-up sources
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Botão
-  esp_sleep_enable_timer_wakeup(power_config.deep_sleep_duration_s * 1000000ULL);
+  // Wake-up sources
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_sleep_enable_timer_wakeup(config.sleep_duration * 1000000ULL);
   
-  // Alocar apenas buffers essenciais inicialmente
-  allocate_minimal_buffers();
-  
-  if (!setup_i2s_low_power()) {
-    Serial.println("❌ Falha na configuração do I2S");
-    error_blink();
-    return;
+  // Alocar buffer mínimo
+  audio_small = (int16_t*)malloc(256 * sizeof(int16_t));
+  if (!audio_small) {
+    Serial.println("❌ Erro: Buffer mínimo");
+    error_loop();
   }
   
-  Serial.println("✅ Sistema inicializado - Modo Economia Ativa!");
-  print_power_info();
+  // Configurar I2S
+  if (!setup_i2s()) {
+    Serial.println("❌ Erro: I2S");
+    error_loop();
+  }
   
-  last_voice_activity = millis();
-  last_user_interaction = millis();
+  // Inicializar ML
+  if (!ml_processor.begin()) {
+    Serial.println("⚠️ ML não disponível - modo simulação");
+  }
+  
+  Serial.println("✅ Sistema pronto!");
+  last_activity = millis();
 }
 
 void loop() {
-  unsigned long current_time = millis();
-  
-  // Verificar botão (sempre prioritário)
-  bool button_pressed = digitalRead(BUTTON_PIN) == LOW;
-  if (button_pressed) {
-    handle_user_interaction();
+  // Verificar botão
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    handle_button();
     return;
   }
   
-  // Máquina de estados de energia
-  switch (current_power_state) {
-    case POWER_ACTIVE:
-      handle_active_mode();
+  // Máquina de estados
+  switch (power_mode) {
+    case ACTIVE:
+      handle_active();
       break;
-      
-    case POWER_LISTENING:
-      handle_listening_mode();
+    case LISTENING:
+      handle_listening();
       break;
-      
-    case POWER_LIGHT_SLEEP:
-      handle_light_sleep_mode();
-      break;
-      
-    case POWER_DEEP_SLEEP:
-      handle_deep_sleep_mode();
+    case SLEEPING:
+      handle_sleep();
       break;
   }
   
-  // Verificar transições de estado
-  check_power_state_transitions();
+  // Transições de estado
+  check_transitions();
   
-  // Relatório periódico (apenas em modo ativo)
-  static unsigned long last_report = 0;
-  if (current_power_state == POWER_ACTIVE && 
-      current_time - last_report > 30000) {
-    print_power_report();
-    last_report = current_time;
-  }
+  delay(config.vad_interval);
 }
 
-void setup_power_management() {
-  // Configurar CPU frequency dinâmica
+void setup_power() {
+  // PM config
   esp_pm_config_esp32_t pm_config = {
     .max_freq_mhz = 240,
-    .min_freq_mhz = power_config.cpu_freq_mhz,
+    .min_freq_mhz = config.low_cpu_freq,
     .light_sleep_enable = true
   };
   esp_pm_configure(&pm_config);
   
-  // Reduzir CPU para economia inicial
-  setCpuFrequencyMhz(power_config.cpu_freq_mhz);
+  // Reduzir CPU
+  setCpuFrequencyMhz(config.low_cpu_freq);
   
-  // Desabilitar WiFi e Bluetooth
+  // Desabilitar WiFi/BT
   WiFi.mode(WIFI_OFF);
   btStop();
   
-  Serial.printf("🔋 CPU reduzida para %d MHz\n", power_config.cpu_freq_mhz);
+  Serial.printf("🔋 CPU: %d MHz\n", config.low_cpu_freq);
 }
 
-void allocate_minimal_buffers() {
-  // Buffer pequeno para VAD (apenas 256 samples)
-  audio_buffer_small = (int16_t*)malloc(256 * sizeof(int16_t));
-  
-  if (!audio_buffer_small) {
-    Serial.println("❌ Falha na alocação de buffer mínimo!");
-    error_blink();
-    return;
-  }
-  
-  Serial.println("💾 Buffers mínimos alocados");
-}
-
-void allocate_full_buffers() {
-  if (buffers_allocated) return;
-  
-  // Alocar buffers completos apenas quando necessário
-  audio_buffer_full = (int16_t*)ps_malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
-  preprocessed_audio = (float*)malloc(INPUT_FEATURES * sizeof(float));
-  
-  if (!audio_buffer_full || !preprocessed_audio) {
-    Serial.println("❌ Falha na alocação de buffers completos!");
-    return;
-  }
-  
-  buffers_allocated = true;
-  Serial.println("💾 Buffers completos alocados");
-}
-
-void deallocate_full_buffers() {
-  if (!buffers_allocated) return;
-  
-  if (audio_buffer_full) {
-    free(audio_buffer_full);
-    audio_buffer_full = nullptr;
-  }
-  
-  if (preprocessed_audio) {
-    free(preprocessed_audio);
-    preprocessed_audio = nullptr;
-  }
-  
-  buffers_allocated = false;
-  Serial.println("💾 Buffers completos liberados");
-}
-
-bool setup_i2s_low_power() {
-  // Configuração I2S otimizada para baixo consumo
+bool setup_i2s() {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = AUDIO_SAMPLE_RATE,
@@ -194,8 +131,8 @@ bool setup_i2s_low_power() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 2,  // Reduzido para economia
-    .dma_buf_len = 256,  // Buffer menor
+    .dma_buf_count = 2,
+    .dma_buf_len = 256,
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -208,260 +145,211 @@ bool setup_i2s_low_power() {
     .data_in_num = I2S_SD_PIN
   };
   
-  esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  if (result != ESP_OK) return false;
-  
-  result = i2s_set_pin(I2S_NUM_0, &pin_config);
-  return result == ESP_OK;
+  return (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) == ESP_OK &&
+          i2s_set_pin(I2S_NUM_0, &pin_config) == ESP_OK);
 }
 
-void handle_active_mode() {
-  unsigned long current_time = millis();
-  
-  // Aumentar CPU para processamento
+void handle_active() {
+  // CPU máxima para processamento
   if (getCpuFrequencyMhz() != 240) {
     setCpuFrequencyMhz(240);
   }
   
-  // Alocar buffers completos se necessário
-  allocate_full_buffers();
+  // Alocar buffers completos
+  ensure_full_buffers();
   
-  // Capturar e processar áudio completo
-  if (capture_full_audio()) {
-    bool voice_detected = preprocess_audio_full();
-    
-    if (voice_detected) {
-      run_inference();
-      last_voice_activity = current_time;
-    }
+  // Capturar e processar áudio
+  if (capture_audio() && preprocess_audio()) {
+    run_inference();
+    last_activity = millis();
   }
-  
-  delay(power_config.vad_check_interval_ms);
 }
 
-void handle_listening_mode() {
-  unsigned long current_time = millis();
-  
-  // CPU em frequência reduzida
-  if (getCpuFrequencyMhz() != power_config.cpu_freq_mhz) {
-    setCpuFrequencyMhz(power_config.cpu_freq_mhz);
+void handle_listening() {
+  // CPU reduzida
+  if (getCpuFrequencyMhz() != config.low_cpu_freq) {
+    setCpuFrequencyMhz(config.low_cpu_freq);
   }
   
-  // Liberar buffers completos para economia
-  deallocate_full_buffers();
+  // Liberar buffers para economia
+  free_full_buffers();
   
-  // Verificar VAD apenas periodicamente
-  if (current_time - last_vad_check > power_config.vad_check_interval_ms) {
-    if (quick_vad_check()) {
-      voice_detected_flag = true;
-      last_voice_activity = current_time;
-    }
-    last_vad_check = current_time;
+  // VAD rápido
+  if (quick_vad()) {
+    voice_detected = true;
+    last_activity = millis();
   }
-  
-  delay(power_config.vad_check_interval_ms);
 }
 
-void handle_light_sleep_mode() {
-  Serial.println("😴 Entrando em Light Sleep...");
+void handle_sleep() {
+  Serial.println("💤 Sleep mode...");
   
-  // Preparar para sleep
-  deallocate_full_buffers();
+  free_full_buffers();
   setCpuFrequencyMhz(80);
   
-  // Light sleep por período curto
-  esp_sleep_enable_timer_wakeup(5000000ULL); // 5 segundos
+  // Light sleep
+  esp_sleep_enable_timer_wakeup(5000000ULL); // 5s
   esp_light_sleep_start();
   
-  wake_count++;
-  Serial.printf("⏰ Wake #%lu - Verificando atividade\n", wake_count);
-  
-  // Verificação rápida após acordar
-  if (quick_vad_check() || digitalRead(BUTTON_PIN) == LOW) {
-    current_power_state = POWER_ACTIVE;
-    last_voice_activity = millis();
+  // Verificar atividade após wake
+  if (quick_vad() || digitalRead(BUTTON_PIN) == LOW) {
+    power_mode = ACTIVE;
+    last_activity = millis();
   }
 }
 
-void handle_deep_sleep_mode() {
-  Serial.println("💤 Entrando em Deep Sleep...");
-  print_power_report();
+void ensure_full_buffers() {
+  if (full_buffers_ready) return;
   
-  // Desabilitar I2S para economia máxima
-  i2s_driver_uninstall(I2S_NUM_0);
+  audio_full = (int16_t*)ps_malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
+  features = (float*)malloc(INPUT_FEATURES * sizeof(float));
   
-  // Configurar RTC GPIO para wake-up
-  rtc_gpio_pullup_en(GPIO_NUM_0);
-  rtc_gpio_pulldown_dis(GPIO_NUM_0);
-  
-  // Deep sleep
-  esp_deep_sleep_start();
+  if (audio_full && features) {
+    full_buffers_ready = true;
+    Serial.println("💾 Buffers alocados");
+  }
 }
 
-bool quick_vad_check() {
-  if (!audio_buffer_small) return false;
+void free_full_buffers() {
+  if (!full_buffers_ready) return;
+  
+  if (audio_full) { free(audio_full); audio_full = nullptr; }
+  if (features) { free(features); features = nullptr; }
+  
+  full_buffers_ready = false;
+}
+
+bool quick_vad() {
+  if (!audio_small) return false;
   
   size_t bytes_read = 0;
-  esp_err_t result = i2s_read(I2S_NUM_0, audio_buffer_small, 
-                             256 * sizeof(int16_t), 
-                             &bytes_read, pdMS_TO_TICKS(10));
+  if (i2s_read(I2S_NUM_0, audio_small, 256 * sizeof(int16_t), 
+               &bytes_read, pdMS_TO_TICKS(10)) != ESP_OK) {
+    return false;
+  }
   
-  if (result != ESP_OK || bytes_read == 0) return false;
-  
-  // VAD simples e rápido
+  // Calcular energia
   float energy = 0.0f;
   int samples = bytes_read / sizeof(int16_t);
   
   for (int i = 0; i < samples; i++) {
-    float sample = audio_buffer_small[i] / 32768.0f;
+    float sample = audio_small[i] / 32768.0f;
     energy += sample * sample;
   }
   
-  energy = energy / samples;
-  return energy > power_config.vad_sensitivity;
+  return (energy / samples) > config.vad_threshold;
 }
 
-bool capture_full_audio() {
-  if (!audio_buffer_full) return false;
+bool capture_audio() {
+  if (!audio_full) return false;
   
   size_t bytes_read = 0;
-  esp_err_t result = i2s_read(I2S_NUM_0, audio_buffer_full, 
-                             AUDIO_BUFFER_SIZE * sizeof(int16_t), 
-                             &bytes_read, pdMS_TO_TICKS(100));
-  
-  return (result == ESP_OK && bytes_read > 0);
+  return (i2s_read(I2S_NUM_0, audio_full, AUDIO_BUFFER_SIZE * sizeof(int16_t), 
+                   &bytes_read, pdMS_TO_TICKS(100)) == ESP_OK && bytes_read > 0);
 }
 
-bool preprocess_audio_full() {
-  if (!preprocessed_audio || !audio_buffer_full) return false;
+bool preprocess_audio() {
+  if (!features || !audio_full) return false;
   
-  // Mesmo processamento do código original
   float energy = 0.0f;
+  
+  // Aplicar janela Hamming e calcular energia
   for (int i = 0; i < AUDIO_BUFFER_SIZE; i++) {
-    float sample = audio_buffer_full[i] / 32768.0f;
+    float sample = audio_full[i] / 32768.0f;
     energy += sample * sample;
     
     if (i < INPUT_FEATURES) {
       float hamming = 0.54f - 0.46f * cosf(2.0f * PI * i / (INPUT_FEATURES - 1));
-      preprocessed_audio[i] = sample * hamming;
+      features[i] = sample * hamming;
     }
   }
   
-  energy = energy / AUDIO_BUFFER_SIZE;
-  
+  // Padding com zeros
   for (int i = AUDIO_BUFFER_SIZE; i < INPUT_FEATURES; i++) {
-    preprocessed_audio[i] = 0.0f;
+    features[i] = 0.0f;
   }
   
-  return energy > VOICE_ACTIVITY_THRESHOLD;
-}
-
-void handle_user_interaction() {
-  Serial.println("👆 Interação do usuário detectada!");
-  
-  current_power_state = POWER_ACTIVE;
-  last_user_interaction = millis();
-  last_voice_activity = millis();
-  voice_detected_flag = false;
-  
-  // Feedback imediato
-  digitalWrite(LED_PIN, HIGH);
-  delay(100);
-  digitalWrite(LED_PIN, LOW);
-}
-
-void check_power_state_transitions() {
-  unsigned long current_time = millis();
-  unsigned long idle_time = current_time - last_voice_activity;
-  unsigned long user_idle_time = current_time - last_user_interaction;
-  
-  switch (current_power_state) {
-    case POWER_ACTIVE:
-      if (idle_time > power_config.active_timeout_ms) {
-        current_power_state = POWER_LISTENING;
-        Serial.println("🔄 Transição: ATIVO → ESCUTANDO");
-      }
-      break;
-      
-    case POWER_LISTENING:
-      if (voice_detected_flag) {
-        current_power_state = POWER_ACTIVE;
-        voice_detected_flag = false;
-        Serial.println("🔄 Transição: ESCUTANDO → ATIVO");
-      } else if (idle_time > power_config.listening_timeout_ms) {
-        current_power_state = POWER_LIGHT_SLEEP;
-        Serial.println("🔄 Transição: ESCUTANDO → LIGHT SLEEP");
-      }
-      break;
-      
-    case POWER_LIGHT_SLEEP:
-      // Após alguns ciclos de light sleep, ir para deep sleep
-      if (wake_count > 5 && user_idle_time > 300000) { // 5 min sem interação
-        current_power_state = POWER_DEEP_SLEEP;
-        Serial.println("🔄 Transição: LIGHT SLEEP → DEEP SLEEP");
-      } else if (voice_detected_flag) {
-        current_power_state = POWER_ACTIVE;
-        voice_detected_flag = false;
-        wake_count = 0;
-        Serial.println("🔄 Transição: LIGHT SLEEP → ATIVO");
-      } else {
-        current_power_state = POWER_LISTENING;
-        Serial.println("🔄 Transição: LIGHT SLEEP → ESCUTANDO");
-      }
-      break;
-  }
+  return (energy / AUDIO_BUFFER_SIZE) > VOICE_ACTIVITY_THRESHOLD;
 }
 
 void run_inference() {
-  // Mesmo código de inferência do original
-  unsigned long start_time = micros();
+  unsigned long start = micros();
   
-  #if TFLITE_AVAILABLE
-  // ... código ML original ...
+  #ifdef TFLITE_AVAILABLE
+  int result = ml_processor.predict(features, INPUT_FEATURES);
+  float confidence = ml_processor.get_confidence();
   #else
-  int fake_class = random(0, OUTPUT_CLASSES);
-  float fake_confidence = 0.75f + random(0, 25) / 100.0f;
-  process_result(fake_class, fake_confidence, micros() - start_time);
+  // Simulação
+  int result = random(0, OUTPUT_CLASSES);
+  float confidence = 0.75f + random(0, 25) / 100.0f;
   #endif
+  
+  process_result(result, confidence, micros() - start);
 }
 
-void process_result(int predicted_class, float confidence, unsigned long inference_time) {
+void process_result(int predicted_class, float confidence, unsigned long time_us) {
   const char* labels[] = {"🔇 Silêncio", "❓ Desconhecido", "✅ Sim", "❌ Não"};
   
   if (confidence > CONFIDENCE_THRESHOLD) {
     Serial.printf("🎯 %s (%.1f%%) - %lu μs\n", 
-                  labels[predicted_class], confidence * 100, inference_time);
+                  labels[predicted_class], confidence * 100, time_us);
     
+    // Feedback LED
     digitalWrite(LED_PIN, HIGH);
     delay(100);
     digitalWrite(LED_PIN, LOW);
   }
 }
 
-void print_power_report() {
-  const char* state_names[] = {"ATIVO", "ESCUTANDO", "LIGHT SLEEP", "DEEP SLEEP"};
+void handle_button() {
+  Serial.println("👆 Botão pressionado!");
   
-  Serial.println("\n🔋 RELATÓRIO DE ENERGIA:");
-  Serial.printf("   🔋 Estado: %s\n", state_names[current_power_state]);
-  Serial.printf("   🧠 CPU: %d MHz\n", getCpuFrequencyMhz());
-  Serial.printf("   💾 RAM livre: %d KB\n", ESP.getFreeHeap() / 1024);
-  Serial.printf("   ⏰ Wakes: %lu\n", wake_count);
-  Serial.printf("   🎤 Última atividade: %lu ms atrás\n", 
-                millis() - last_voice_activity);
-  Serial.printf("   💾 Buffers completos: %s\n", 
-                buffers_allocated ? "Alocados" : "Liberados");
+  power_mode = ACTIVE;
+  last_activity = millis();
+  voice_detected = false;
+  
+  // Feedback
+  digitalWrite(LED_PIN, HIGH);
+  delay(100);
+  digitalWrite(LED_PIN, LOW);
 }
 
-void print_power_info() {
-  Serial.println("\n🔋 CONFIGURAÇÃO DE ENERGIA:");
-  Serial.printf("   ⏱️  Timeout ativo: %lu ms\n", power_config.active_timeout_ms);
-  Serial.printf("   👂 Timeout escuta: %lu ms\n", power_config.listening_timeout_ms);
-  Serial.printf("   💤 Deep sleep: %lu s\n", power_config.deep_sleep_duration_s);
-  Serial.printf("   🎤 VAD interval: %lu ms\n", power_config.vad_check_interval_ms);
-  Serial.printf("   🎛️  Sensibilidade: %.4f\n", power_config.vad_sensitivity);
+void check_transitions() {
+  unsigned long idle_time = millis() - last_activity;
+  
+  switch (power_mode) {
+    case ACTIVE:
+      if (idle_time > config.active_timeout) {
+        power_mode = LISTENING;
+        Serial.println("🔄 ATIVO → ESCUTANDO");
+      }
+      break;
+      
+    case LISTENING:
+      if (voice_detected) {
+        power_mode = ACTIVE;
+        voice_detected = false;
+        Serial.println("🔄 ESCUTANDO → ATIVO");
+      } else if (idle_time > config.listen_timeout) {
+        power_mode = SLEEPING;
+        Serial.println("🔄 ESCUTANDO → DORMINDO");
+      }
+      break;
+      
+    case SLEEPING:
+      if (voice_detected || digitalRead(BUTTON_PIN) == LOW) {
+        power_mode = ACTIVE;
+        voice_detected = false;
+        Serial.println("🔄 DORMINDO → ATIVO");
+      } else {
+        power_mode = LISTENING;
+        Serial.println("🔄 DORMINDO → ESCUTANDO");
+      }
+      break;
+  }
 }
 
-void error_blink() {
+void error_loop() {
   while(1) {
     digitalWrite(LED_PIN, HIGH);
     delay(200);
