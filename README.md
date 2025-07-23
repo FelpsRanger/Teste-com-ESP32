@@ -1,3 +1,18 @@
+# 🎙️ TinyML Voice Recognition com ESP32-S3
+
+Reconhecimento de comandos de voz embarcado usando **TinyML no ESP32-S3**, com detecção de atividade vocal (VAD), energia inteligente, captura via I²S e inferência com TensorFlow Lite.
+
+---
+
+## 📦 Recursos
+
+- ✅ Inferência com modelo real treinado em TensorFlow Lite
+- 🔊 Captura de áudio via microfone digital I²S
+- 🧠 Processamento de features: janela Hamming + VAD
+- 🔋 Gerenciamento dinâmico de energia com redução de frequência da CPU
+- 🎯 Classificação de comandos como "Sim", "Não", "Silêncio", etc.
+- 💤 Modo de baixo consumo com sleep leve
+- 🟢 Feedback via LED integrado
 
 ---
 
